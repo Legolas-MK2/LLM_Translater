@@ -195,7 +195,7 @@ class TranslationTrainer:
         logger.info(f"Total number of examples in dataset: {len(df)}")
 
         # Split into train and evaluation sets
-        train_df, eval_df = train_test_split(df, test_size=0.05, random_state=42)
+        train_df, eval_df = train_test_split(df, test_size=0.04, random_state=42)
         logger.info(f"Training set size: {len(train_df)}")
         logger.info(f"Evaluation set size: {len(eval_df)}")
 
