@@ -1,3 +1,4 @@
+import gc
 import torch
 from transformers import (
     AutoTokenizer,
@@ -5,9 +6,8 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from peft import get_peft_model, LoraConfig, TaskType
 from transformers import BitsAndBytesConfig
 import logging
@@ -16,14 +16,12 @@ from datetime import datetime
 from transformers import TrainerCallback
 import torch.nn as nn
 import bitsandbytes as bnb
-from typing import Optional, Dict, Union, Any
+from typing import Optional, Dict, Union, Any, Generator
 from torch.utils.data import DataLoader
+import glob
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Set environment variables
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 
@@ -57,7 +55,6 @@ class CustomTrainer(Trainer):
     def get_eval_dataloader(self, eval_dataset=None) -> DataLoader:
         if eval_dataset is None:
             eval_dataset = self.eval_dataset
-
         return DataLoader(
             eval_dataset,
             batch_size=self.args.per_device_eval_batch_size,
@@ -67,7 +64,7 @@ class CustomTrainer(Trainer):
             prefetch_factor=self.prefetch_factor
         )
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False):
         if "labels" in inputs:
             labels = inputs.pop("labels")
         else:
@@ -86,21 +83,14 @@ class CustomTrainer(Trainer):
 
         return (loss, outputs) if return_outputs else loss
 
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        model.train()
-        inputs = self._prepare_inputs(inputs)
-
-        loss = self.compute_loss(model, inputs)
-
-        if self.args.gradient_accumulation_steps > 1:
-            loss = loss / self.args.gradient_accumulation_steps
-
-        if num_items_in_batch is not None:
-            loss = loss / num_items_in_batch
-
-        loss.backward()
-
-        return loss.detach()
+class BatchProcessingTrainer(CustomTrainer):
+    def train_epoch_with_batches(self, batch_generator: Generator):
+        self.model.train()
+        for batch_dataset in batch_generator:
+            self.train_dataset = batch_dataset
+            super().train()
+            gc.collect()
+            torch.cuda.empty_cache()
 
 
 class CustomCallback(TrainerCallback):
@@ -115,9 +105,10 @@ class CustomCallback(TrainerCallback):
             self.logger.info(f"Step {state.global_step}: {logs}")
 
 
-class TranslationTrainer:
-    def __init__(self, model_name="numind/NuExtract-1.5-smol"):
+class BidirectionalTranslationTrainer:
+    def __init__(self, model_name="numind/NuExtract-1.5-smol", batch_size=50000):
         self.model_name = model_name
+        self.batch_size = batch_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
@@ -140,7 +131,6 @@ class TranslationTrainer:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        # Quantization config
         self.bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -161,7 +151,6 @@ class TranslationTrainer:
         self.model.gradient_checkpointing_enable()
         self.model.enable_input_require_grads()
 
-        # LoRA configuration
         peft_config = LoraConfig(
             lora_alpha=16,
             lora_dropout=0.1,
@@ -174,7 +163,6 @@ class TranslationTrainer:
 
         self.model = get_peft_model(self.model, peft_config)
 
-        # Set up trainable parameters
         for name, param in self.model.named_parameters():
             if 'lora' in name.lower():
                 param.requires_grad = True
@@ -186,25 +174,47 @@ class TranslationTrainer:
         logger.info(
             f"trainable params: {trainable_params} || all params: {total_params} || trainable%: {100 * trainable_params / total_params:.4f}")
 
-    def prepare_dataset(self, file_path):
-        logger.info("Preparing dataset...")
-        df = pd.read_parquet(file_path)
+    def batch_data_generator(self, data_dir: str) -> Generator:
+        train_files = glob.glob(os.path.join(data_dir, "de-en", "train-*.parquet"))
 
-        # Log dataset size
-        logger.info(f"Total number of examples in dataset: {len(df)}")
+        for file in train_files:
+            df = pd.read_parquet(file)
+            total_rows = len(df)
 
-        # Split into train and evaluation sets
-        train_df, eval_df = train_test_split(df, test_size=0.03, random_state=42)
-        logger.info(f"Training set size: {len(train_df)}")
-        logger.info(f"Evaluation set size: {len(eval_df)}")
+            for start in range(0, total_rows, self.batch_size):
+                chunk = df.iloc[start:min(start + self.batch_size, total_rows)]
+                translations = pd.json_normalize(chunk['translation'])
 
-        self.train_dataset = Dataset.from_pandas(train_df)
-        self.eval_dataset = Dataset.from_pandas(eval_df)
+                combined = pd.concat([
+                    pd.DataFrame({
+                        'text': translations['de'],
+                        'translation': translations['en'],
+                        'direction': 'de-en'
+                    }),
+                    pd.DataFrame({
+                        'text': translations['en'],
+                        'translation': translations['de'],
+                        'direction': 'en-de'
+                    })
+                ])
 
+                dataset = Dataset.from_pandas(combined)
+                processed_dataset = self._process_dataset(dataset)
+
+                yield processed_dataset
+
+                del chunk, translations, combined, dataset
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            del df
+            gc.collect()
+
+    def _process_dataset(self, dataset: Dataset) -> Dataset:
         def preprocess_function(examples):
             prompts = [
-                f"EN: {src}\nDE: {tgt}</s>"
-                for src, tgt in zip(examples["text"], examples["translation"])
+                f"{dir.split('-')[0].upper()}: {src}\n{dir.split('-')[1].upper()}: {tgt}</s>"
+                for src, tgt, dir in zip(examples["text"], examples["translation"], examples["direction"])
             ]
 
             model_inputs = self.tokenizer(
@@ -214,97 +224,32 @@ class TranslationTrainer:
                 padding="max_length",
                 return_tensors=None
             )
-
             model_inputs["labels"] = model_inputs["input_ids"].copy()
             return model_inputs
 
-        # Process datasets without multiprocessing
-        self.tokenized_train = self.train_dataset.map(
+        processed = dataset.map(
             preprocess_function,
             batched=True,
             batch_size=1000,
-            remove_columns=self.train_dataset.column_names,
-            desc="Processing training data",
-            num_proc=None  # Disabled multiprocessing
+            remove_columns=dataset.column_names,
+            desc="Processing batch"
         )
-
-        self.tokenized_eval = self.eval_dataset.map(
-            preprocess_function,
-            batched=True,
-            batch_size=1000,
-            remove_columns=self.eval_dataset.column_names,
-            desc="Processing validation data",
-            num_proc=None  # Disabled multiprocessing
-        )
-
-        self.tokenized_train.set_format("torch")
-        self.tokenized_eval.set_format("torch")
-
-        logger.info(f"Processed {len(self.tokenized_train)} training examples")
-        logger.info(f"Processed {len(self.tokenized_eval)} evaluation examples")
-
-    def train(self, resume_from=None):
-        training_args = TrainingArguments(
-            output_dir=os.path.join(self.checkpoint_base, "checkpoints"),
-            eval_strategy="steps",
-            eval_steps=500,  # Erhöht von 200
-            save_strategy="steps",
-            save_steps=500,  # Erhöht von 200
-            save_total_limit=3,
-            learning_rate=5e-4,  # Erhöht von 2e-4
-            per_device_train_batch_size=4,  # Erhöht von 2
-            per_device_eval_batch_size=4,  # Erhöht von 2
-            gradient_accumulation_steps=8,  # Reduziert von 16
-            num_train_epochs=2,
-            weight_decay=0.05,  # Erhöht von 0.01
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_loss",
-            bf16=True,
-            logging_dir=os.path.join(self.checkpoint_base, "logs"),
-            logging_steps=50,  # Erhöht von 10
-            report_to="tensorboard",
-            gradient_checkpointing=True,
-            max_grad_norm=1.0,
-            warmup_ratio=0.05,  # Erhöht von 0.03
-            remove_unused_columns=False,
-            label_smoothing_factor=0.1,
-            optim="paged_adamw_8bit",
-            ddp_find_unused_parameters=False,
-            dataloader_num_workers=4,
-            group_by_length=True
-        )
-
-        trainer = CustomTrainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=self.tokenized_train,
-            eval_dataset=self.tokenized_eval,
-            callbacks=[CustomCallback(self, logger)],
-            optimizers=(self._create_optimizer(training_args), None)
-        )
-
-        try:
-            logger.info("Starting training...")
-            trainer.train(resume_from_checkpoint=resume_from)
-            self.save_model(os.path.join(self.checkpoint_base, "final_model"))
-        except Exception as e:
-            logger.error(f"Training error: {str(e)}")
-            self.save_model(os.path.join(self.checkpoint_base, "emergency_save"))
-            raise
+        processed.set_format("torch")
+        return processed
 
     def _create_optimizer(self, training_args):
         no_decay = ['bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
             {
                 "params": [p for n, p in self.model.named_parameters()
-                          if not any(nd in n for nd in no_decay)
-                          and p.requires_grad],
+                           if not any(nd in n for nd in no_decay)
+                           and p.requires_grad],
                 "weight_decay": training_args.weight_decay,
             },
             {
                 "params": [p for n, p in self.model.named_parameters()
-                          if any(nd in n for nd in no_decay)
-                          and p.requires_grad],
+                           if any(nd in n for nd in no_decay)
+                           and p.requires_grad],
                 "weight_decay": 0.0,
             }
         ]
@@ -314,11 +259,66 @@ class TranslationTrainer:
             "betas": (0.9, 0.95),
             "eps": 1e-8
         }
-        optimizer = bnb.optim.AdamW8bit(
+        return bnb.optim.AdamW8bit(
             optimizer_grouped_parameters,
             **optimizer_kwargs
         )
-        return optimizer
+
+    def train(self, data_dir: str, resume_from: Optional[str] = "auto"):
+        training_args = TrainingArguments(
+            output_dir=os.path.join(self.checkpoint_base, "checkpoints"),
+            eval_strategy="steps",
+            eval_steps=500,
+            save_strategy="steps",
+            save_steps=500,
+            save_total_limit=3,
+            learning_rate=5e-4,
+            per_device_train_batch_size=4,
+            per_device_eval_batch_size=4,
+            gradient_accumulation_steps=8,
+            num_train_epochs=1,
+            weight_decay=0.05,
+            bf16=True,
+            logging_dir=os.path.join(self.checkpoint_base, "logs"),
+            logging_steps=50,
+            gradient_checkpointing=True,
+            max_grad_norm=1.0,
+            warmup_ratio=0.05,
+            remove_unused_columns=False,
+            label_smoothing_factor=0.1,
+            optim="paged_adamw_8bit",
+            ddp_find_unused_parameters=False,
+            dataloader_num_workers=4,
+            group_by_length=True,
+            report_to="none"  # Disable wandb logging
+        )
+
+        # Load validation dataset once
+        val_df = pd.read_parquet(os.path.join(data_dir, "de-en", "validation-00000-of-00001.parquet"))
+        val_translations = pd.json_normalize(val_df['translation'])
+        eval_dataset = self._process_dataset(Dataset.from_pandas(pd.concat([
+            pd.DataFrame({'text': val_translations['de'], 'translation': val_translations['en'], 'direction': 'de-en'}),
+            pd.DataFrame({'text': val_translations['en'], 'translation': val_translations['de'], 'direction': 'en-de'})
+        ])))
+
+        trainer = BatchProcessingTrainer(
+            model=self.model,
+            args=training_args,
+            eval_dataset=eval_dataset,
+            callbacks=[CustomCallback(self, logger)],
+            optimizers=(self._create_optimizer(training_args), None)
+        )
+
+        try:
+            for epoch in range(2):
+                logger.info(f"Starting epoch {epoch + 1}")
+                batch_generator = self.batch_data_generator(data_dir)
+                trainer.train_epoch_with_batches(batch_generator)
+                self.save_model(os.path.join(self.checkpoint_base, f"epoch_{epoch + 1}"))
+        except Exception as e:
+            logger.error(f"Training error: {str(e)}")
+            self.save_model(os.path.join(self.checkpoint_base, "emergency_save"))
+            raise
 
     def save_model(self, output_dir):
         logger.info(f"Saving model to {output_dir}")
@@ -326,9 +326,12 @@ class TranslationTrainer:
         self.model.save_pretrained(output_dir)
         self.tokenizer.save_pretrained(output_dir)
 
-    def translate(self, text):
+    def translate(self, text: str, direction: str = "en-de"):
         self.model.eval()
-        prompt = f"EN: {text}\nDE:"
+        src_lang = direction.split('-')[0].upper()
+        tgt_lang = direction.split('-')[1].upper()
+        prompt = f"{src_lang}: {text}\n{tgt_lang}:"
+
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
 
         with torch.no_grad():
@@ -344,34 +347,12 @@ class TranslationTrainer:
             )
 
         translation = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return translation.split("DE:")[-1].strip()
+        return translation.split(f"{tgt_lang}:")[-1].strip()
 
 
 if __name__ == "__main__":
     MODEL_NAME = "numind/NuExtract-1.5-smol"
-    DATASET_PATH = "train-00000-of-00001.parquet"
+    DATA_DIR = "wmt14"
 
-    # Um komplett neu zu starten (ohne Checkpoint):
-    trainer = TranslationTrainer(model_name=MODEL_NAME)
-    trainer.prepare_dataset(DATASET_PATH)
-    trainer.train(resume_from=None)  # None bedeutet Neustart
-
-    # ODER wenn du den Checkpoint laden willst:
-    # 1. Prüfe den exakten Pfad:
-    import os
-
-    CHECKPOINT_DIR = os.path.join(os.getcwd(), "20241117_172820/checkpoints/checkpoint-400")
-
-    # 2. Überprüfe ob der Pfad existiert:
-    if os.path.exists(CHECKPOINT_DIR):
-        trainer = TranslationTrainer(model_name=MODEL_NAME)
-        trainer.prepare_dataset(DATASET_PATH)
-        trainer.train(resume_from=CHECKPOINT_DIR)
-    else:
-        print(f"Checkpoint nicht gefunden unter: {CHECKPOINT_DIR}")
-        print("Starte neues Training...")
-        trainer = TranslationTrainer(model_name=MODEL_NAME)
-        trainer.prepare_dataset(DATASET_PATH)
-        trainer.train(resume_from=None)
-
-
+    trainer = BidirectionalTranslationTrainer(model_name=MODEL_NAME, batch_size=5000)
+    trainer.train(data_dir=DATA_DIR)

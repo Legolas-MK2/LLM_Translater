@@ -335,7 +335,7 @@ class TranslationTrainer:
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=48,
-                temperature=0.1,
+                temperature=0.5,
                 do_sample=True,
                 top_p=0.95,
                 num_beams=5,
@@ -412,12 +412,12 @@ def test_translation(checkpoint_dir, test_texts, base_model_name="numind/NuExtra
 
 
 if __name__ == "__main__":
-    checkpoint_dir = "checkpoints/20241117_184911/checkpoints/checkpoint-1000"
+    checkpoint_dir = "checkpoints/20241118_073529/final_model"
     base_model = "numind/NuExtract-1.5-smol"
 
     test_texts = [
-        "The optimization has reduced memory usage by 35% and improved overall performance."
-    ]*10
+        "The sun is shining, and the birds are singing. It is beautiful day to go for a walk in the park."
+    ]
 
     translations = test_translation(checkpoint_dir, test_texts, base_model)
 
